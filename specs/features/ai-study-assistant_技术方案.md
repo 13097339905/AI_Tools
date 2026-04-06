@@ -1,0 +1,161 @@
+# AI 视频/音频学习助手 — 技术设计文档
+
+## 1. 设计概要
+
+**功能描述**：
+本功能旨在为用户提供一站式的视频/音频转文字及 AI 学习总结服务。用户通过粘贴链接或实时录音，系统自动完成解析、转录、总结、生成题目及闪卡，并支持导出。
+
+**影响范围**：
+- 小程序前端：新增学习助手主页、结果展示页、积分管理页。
+- 云开发后端：新增云函数（处理 API 调用、逻辑分发）、云数据库（存储记录、积分、题目）、云存储（暂存音频文件）。
+
+**技术难点**：
+- 长视频（2小时）的异步处理与分段总结逻辑。
+- 多平台视频链接的去水印解析。
+- 结构化 AI 提示词（Prompt）设计，确保输出稳定的总结、题目和闪卡。
+
+**外部依赖**：
+- 腾讯云/阿里云 ASR（语音转文字）。
+- 通义千问/文心一言 API（AI 总结）。
+- 第三方视频解析 API（如 Videoparse）。
+
+---
+
+## 2. 架构概览
+
+### 核心数据流
+
+1. **用户侧**：提交链接或录音文件。
+2. **云函数 (Controller)**：接收请求，检查积分（BR-002），调用解析接口。
+3. **解析/转录层**：调用外部 ASR 接口获取全文文本。
+4. **AI 逻辑层**：根据转录文本，调用大模型生成总结、题目、闪卡（AC-003）。
+5. **存储层**：将结果存入云数据库，返回给前端。
+
+```mermaid
+sequenceDiagram
+    participant User as 用户/小程序
+    participant CF as 云函数 (Node.js)
+    participant DB as 云数据库 (MongoDB)
+    participant Ext as 外部服务 (ASR/LLM/解析)
+
+    User->>CF: 提交链接/录音
+    CF->>DB: 校验并扣除积分 (BR-002)
+    CF->>Ext: 调用视频解析 & 提取音频
+    Ext-->>CF: 返回音频地址
+    CF->>Ext: 调用 ASR (语音转文字)
+    Ext-->>CF: 返回全文文本
+    CF->>Ext: 调用 LLM (总结/题目/闪卡)
+    Ext-->>CF: 返回结构化 JSON
+    CF->>DB: 保存学习记录 & 题目
+    CF-->>User: 返回处理成功，展示结果 (AC-001)
+```
+
+---
+
+## 3. 数据库设计
+
+### 新增表
+
+#### `study_records`
+**用途**：存储用户的学习记录及 AI 生成的内容。
+
+| 字段名 | 类型 | 约束 | 说明 |
+| :--- | :--- | :--- | :--- |
+| _id | String | PK | 记录唯一 ID |
+| openid | String | Index | 用户标识 |
+| type | String | - | 类型: 'video_link', 'audio_file', 'record' |
+| source_url | String | - | 原始链接/文件地址 |
+| transcript | String | - | 语音转录全文 |
+| summary | Object | - | AI 总结内容 (含大纲、重点) |
+| questions | Array | - | 自测题目列表 (含解析) |
+| flashcards | Array | - | 自动生成的闪卡列表 |
+| duration | Number | - | 视频/音频时长 (秒) |
+| created_at | Date | Default Now | 创建时间 |
+
+#### `user_wallets`
+**用途**：管理用户积分和计费逻辑。
+
+| 字段名 | 类型 | 约束 | 说明 |
+| :--- | :--- | :--- | :--- |
+| openid | String | PK | 用户标识 |
+| points | Number | Default 10 | 剩余积分 |
+| total_used | Number | - | 累计消耗 |
+| last_recharge | Date | - | 最后充值时间 |
+
+---
+
+## 4. API 设计
+
+### `POST /processStudyTask`
+**描述**：提交学习任务（链接或录制后的文件） → AC-001, AC-002
+
+**鉴权**：需登录
+
+**Request**:
+```json
+{
+  "type": "video_link", 
+  "url": "https://www.bilibili.com/video/BV...",
+  "audio_file_id": "" // 如果是录音/文件上传
+}
+```
+
+**Response（成功）**:
+```json
+{
+  "code": 0,
+  "data": {
+    "task_id": "rec_123456",
+    "status": "processing"
+  }
+}
+```
+
+---
+
+### `GET /getStudyResult`
+**描述**：轮询或获取处理结果 → AC-003
+
+**Request**:
+```json
+{ "task_id": "rec_123456" }
+```
+
+**Response（成功）**:
+```json
+{
+  "code": 0,
+  "data": {
+    "status": "completed",
+    "summary": "...",
+    "questions": [...],
+    "flashcards": [...],
+    "transcript": "..."
+  }
+}
+```
+
+---
+
+## 5. 核心逻辑
+
+### 5.1 积分扣除逻辑 (BR-002)
+- 系统根据视频时长（由解析接口返回）计算所需积分：`Math.ceil(duration / 600)` (每10分钟1分)。
+- 余额不足时返回错误码 `POINTS_INSUFFICIENT` → AC-005。
+
+### 5.2 AI 提示词设计 (AC-003)
+为了保证输出格式稳定，Prompt 采用结构化指令：
+> "你是一个资深的教育专家。请根据以下转录文本，输出 JSON 格式的内容，包含：
+> 1. summary: { outline: [], key_points: [] }
+> 2. must_know: []
+> 3. quiz: [{ question: '', options: [], answer: '', analysis: '' }]
+> 4. flashcards: [{ front: '', back: '' }]
+> 转录文本如下：{{transcript}}"
+
+### 5.3 长视频分段处理 (BR-001)
+- 对于超过 30 分钟的视频，ASR 采用异步长语音识别。
+- AI 总结采用“分段摘要 + 全局总结”模式，避免超出 Token 限制。
+
+### 5.4 导出实现 (AC-005)
+- **Markdown**: 云函数拼接字符串返回，前端调用 `wx.setClipboardData` 或文件保存。
+- **Anki**: 遵循 `.apkg` 或简单的 `.txt` (Tab 分隔符) 格式导出。
